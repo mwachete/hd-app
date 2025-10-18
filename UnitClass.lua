@@ -70,6 +70,8 @@ local REPLICATED_PROPERTIES = {
 
 Unit.__index = Unit
 
+--both client() and server() functions are to ensure methods are being called from the correct environment
+--mainly for debug purposes obv but assert will throw error and cease exec if it *is* the wrong env somehow
 local function Client()
 	local Caller, FunctionName
 
@@ -202,6 +204,7 @@ function Unit:BroadcastCreation()
 	})
 end
 
+--self.Dead = true lol
 function Unit:Kill()
 	Server()
 
@@ -209,20 +212,22 @@ function Unit:Kill()
 	self.Dead = true
 end
 
+--takes damage of Amount clamped to 0 lowest & runs kill method if health falls hits 0
 function Unit:TakeDamage(Amount: number): number
 	Server()
 	local RealDamage = Amount * self.DampenFactor
 
 	local PreviousHealth = self.HP
-	self.HP = math.clamp(self.HP - RealDamage, 0, math.huge)
+	self.HP = math.max(self.HP - RealDamage, 0)
 
 	Utility.Debug(`'{self.Name}' [UID {self.Identifier}] HP {PreviousHealth} -> {self.HP}`)
 
-	if self.HP <= 0 then
+	if self.HP == 0 then
 		self:Kill()
 	end
 end
 
+--unfinished, would take enemy and use the :TakeDamage method on it (enemy is a seperate class but has similar methods)
 function Unit:Attack(Enemy: Types.EnemyUnit)
 	Server()
 
@@ -231,6 +236,7 @@ function Unit:Attack(Enemy: Types.EnemyUnit)
 	end
 end
 
+--some damage dampening function, would be used for ally ultimate ability sorta thing
 function Unit:ApplyDampen(Amount: number, LengthOfTime: number)
 	Server()
 
@@ -248,7 +254,7 @@ function Unit:ApplyDampen(Amount: number, LengthOfTime: number)
 end
 
 --client only, handles all the visual stuff
---creates the character model and ui elements
+--creates the character model and ui elements based on object name
 function Unit:AddCharacter(Position: CFrame?): Model?
 	Client()
 
