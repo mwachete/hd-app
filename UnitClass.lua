@@ -75,6 +75,13 @@ Unit.__index = Unit
 local function Client()
 	local Caller, FunctionName
 
+	--this is very similar to the server function below so i'll just explain for this one
+	--we expect this function to be called by the objects methods, which in turn are called by the module that created the object, meaning we're at debug 'level' 3
+	--debug.info(3, "s") is getting the path of the script that we care about, and we split it by period as it returns a path string split by periods
+	--our Caller variable is then assigned to be the end of the path, so its just the script name
+	--function name is debug level 2 as we only care about the method that called the function, not the function that called the method that called the function (mouthful)
+	--i only do this when in studio for debugging purposes, and if in a normal game environment, use a generic 'client function called by the server' or vice versa message
+	
 	if RunService:IsStudio() then
 		Caller = string.split(debug.info(3, "s"), ".")
 		Caller = Caller[#Caller]
@@ -96,6 +103,9 @@ local function Server()
 	assert(RunService:IsServer(), `[{Caller or script.Name}]: Server function{FunctionName and " '"..FunctionName.."'" or "" } called by a client.`)
 end
 
+--Unit.New is the function of the class that creates the object. an object can be made from the client or the server, but in practice will never be directly made on the client unless
+--the client recieves a broadcast containing data for an object it doesnt yet have a local copy of (it knows this via the Identifier value which is a GUID),
+--and in that case it will create an object with the same properties, as mentioned in the beginning explanation
 function Unit.New(Owner: Player, Name: string, Attributes: Types.UnitAttributes)
 	local UnitDefaults = UnitData[Name]
 
@@ -103,6 +113,8 @@ function Unit.New(Owner: Player, Name: string, Attributes: Types.UnitAttributes)
 		return Utility.Debug(`Unit defaults not found, creation failed.`)
 	end
 
+	--for most of these properties that arent retrieved from a data module (UnitDefaults defined above), we will use either the Attributes table provided value, or the default
+	--this means you could call Unit.New(Player, "UnitName", {Damage = 9999, WalkSpeed = 9999}), and make an extremely fast & heavy hitting kinda guy
 	local Properties = {
 		Identifier = Attributes.Identifier or HttpService:GenerateGUID(false),
 		Name = Name,
@@ -117,12 +129,12 @@ function Unit.New(Owner: Player, Name: string, Attributes: Types.UnitAttributes)
 		DampenFactor = Attributes.DampenFactor or 1,
 		Dead = false
 	}
-
 	Properties.HP = Properties.MaxHP
 
-	--metatable does the heavy lifting here
-	--__index lets us access Properties table directly through self (self.HP instead of self._Properties.HP)
-	--__newindex handles property changes and triggers replication
+	--__index metamethod lets us access _Properties table directly through self (self.HP instead of self._Properties.HP), while preserving method calls by checking if the key exists in the object first
+	--__newindex metamethod handles property changes and triggers replication. by using this 'nested' _Properties table we're able to invoke the __newindex metamethod every time we
+	--change a value, e.g Unit.WalkSpeed = 10, and with that we can add it to the _DirtyProperties table and flip the flag for a pending update & defer the broadcast changes method to run
+	--and send this changed info to the client
 	local self = setmetatable({
 		_Properties = Properties,
 		_DirtyProperties = {}, --tracks what changed since last broadcast
@@ -138,8 +150,7 @@ function Unit.New(Owner: Player, Name: string, Attributes: Types.UnitAttributes)
 			if Properties[Key] ~= Value then
 				Properties[Key] = Value
 
-				--server side, track changes and schedule a broadcast
-				--dirty properties accumulate until BroadcastChanges runs
+				--if the environment is on the server when a property is changed, then we add the change to the aforementioned _DirtyProperties table and do the update as mentioned above
 				if RunService:IsServer() and REPLICATED_PROPERTIES[Key] then
 					Table._DirtyProperties[Key] = Value
 
@@ -150,7 +161,8 @@ function Unit.New(Owner: Player, Name: string, Attributes: Types.UnitAttributes)
 					end
 				end
 				
-				--client side, update visuals immediately when properties change
+				--if the environment is on the client then we invoke the client specific PropertyChanged method with the key as an argument
+				--this will allow the client to make changes as needed, for example when the .Position property is changed, we make the character model walk to the new position
 				if RunService:IsClient() then
 					Table:PropertyChanged(Key)
 				end
@@ -160,6 +172,7 @@ function Unit.New(Owner: Player, Name: string, Attributes: Types.UnitAttributes)
 
 	Utility.Debug(`Ally unit created '{Properties.Name}' [{Properties.HP}/{Properties.MaxHP}] [UID {Properties.Identifier}]`)
 
+	--if we're creating this object from the server, that means we still need it to be replicated by the clients, in which case we run the broadcast creation method below
 	if RunService:IsServer() then
 		self:BroadcastCreation()
 	end
@@ -172,8 +185,15 @@ end
 function Unit:BroadcastChanges()
 	Server()
 
+	--here we're just using the next function to check if there are any key value pairs in the dirtyproperties table
+	--this broadcast changes method shouldnt have been called otherwise, but better safe than sorry lol
 	if not next(self._DirtyProperties) then return end
 
+	--we send the type of signal as a string mainly for more descriptive debug prints on the client
+	--although when an object is made on the server, we use the broadcast creation method, the UnitUpdate tag here doesn't exclusively mean
+	--we wont ever create a unit from this signal, it just means we may do it in a different way, for instance: if a unit is JUST created, we might add some particle vfx when the model spawns
+	--whereas if the client has just joined and recieves a UnitUpdate signal from the server, we might want to just immediately replicate object & its model with no VFX,
+	--as its just catching up to the current server state.
 	UnitManagementRemote:FireAllClients({
 		Type = "UnitUpdate",
 		Identifier = self._Properties.Identifier,
@@ -185,17 +205,19 @@ function Unit:BroadcastChanges()
 	self._PendingUpdate = false
 end
 
---tells clients to create their own version of this unit
+--tells clients to create their own version of this unit when a new object is made
 --theyll make the same class and mirror properties
 function Unit:BroadcastCreation()
 	Server()
 
 	local InitialState = {}
 
+	--here we're making a cpy of the properties table to send to the client to replicate
 	for Key, Value in self._Properties do
 		InitialState[Key] = Value
 	end
 
+	--much like above we send the same information, including the GUID identifier to ensure we're syncing properties to the correct object
 	UnitManagementRemote:FireAllClients({
 		Type = "UnitCreated",
 		Identifier = self._Properties.Identifier,
@@ -204,7 +226,7 @@ function Unit:BroadcastCreation()
 	})
 end
 
---self.Dead = true lol
+--self.Dead = true lol, this is just a flag thats used to validate whether a unit can take more damage, or move, etc.
 function Unit:Kill()
 	Server()
 
@@ -212,11 +234,15 @@ function Unit:Kill()
 	self.Dead = true
 end
 
---takes damage of Amount clamped to 0 lowest & runs kill method if health falls hits 0
+--takes damage of Amount clamped to 0 lowest & runs kill method if health hits 0
 function Unit:TakeDamage(Amount: number): number
 	Server()
+	--we use the DampenFactor property to get a RealDamage number, this is functionality that would allow for units of a certain class to 'buff' their teammates
+	--and provide them with a lessened damage effect, explained in further detail in the ApplyDampen method below
 	local RealDamage = Amount * self.DampenFactor
 
+	--here we store PreviousHealth before it gets changed for the purposes of a debug print, and set the HP value to math.max between the hp-realdamage and 0
+	--this will ensure our health never goes below 0, as it wouldn't make much sense to & would be ugly
 	local PreviousHealth = self.HP
 	self.HP = math.max(self.HP - RealDamage, 0)
 
@@ -239,12 +265,17 @@ end
 --some damage dampening function, would be used for ally ultimate ability sorta thing
 function Unit:ApplyDampen(Amount: number, LengthOfTime: number)
 	Server()
-
+			
+	--here we store the PreviousDampen value for debug purposes, and change the dampening factor in accordance to the amount argument given
+	--we clamp the dampen factor between 0-1 as it will be used as a multiplier on damage, for example:
+	--local Damage = 10 * self.DampenFactor
+	--which makes any attacks weaker
 	local PreviousDampen = self.DampenFactor
 	self.DampenFactor = math.clamp(self.DampenFactor - Amount, 0, 1)
 
 	Utility.Debug(`{self.Name} [UID {self.Identifier}] Dampen factor {PreviousDampen} -> {self.DampenFactor}`)
 
+	--use the task lib delay function to remove the dampen factor after the specified period of time, also clamped to prevent anomalous values
 	task.delay(LengthOfTime, function()
 		PreviousDampen = self.DampenFactor
 		self.DampenFactor = math.clamp(self.DampenFactor + Amount, 0, 1)
@@ -271,6 +302,9 @@ function Unit:AddCharacter(Position: CFrame?): Model?
 		return Utility.Debug(`Prefab '{self.Name}' not found.`)
 	end
 
+	--after validating all of the information regarding the object is correct, and we have a prefab model to clone, we begin replicating a model on the client that follows server properties
+	--we immediately set the position of a new model to the self.Position CFrame, just so we're not walking from 0,0,0 to wherever when it's created
+
 	self.Character = Prefab:Clone()
 
 	if self.Position then
@@ -279,7 +313,7 @@ function Unit:AddCharacter(Position: CFrame?): Model?
 
 	self.Character.Parent = workspace
 	
-	--setup the ui for this unit
+	--here we set up the UI for the unit, this is the on-screen display with the units name & health shown to the player
 	local Player = Players.LocalPlayer
 	local PlayerGui = Player:WaitForChild("PlayerGui")
 	local MainUI = PlayerGui:WaitForChild("MainUI")
@@ -293,7 +327,8 @@ function Unit:AddCharacter(Position: CFrame?): Model?
 	NewUnitUI.HPBar.Container.Marker.Position = UDim2.fromScale(HPScale, 0.5)
 	NewUnitUI.NameLabel.Text = self.Name
 	NewUnitUI.Parent = ActiveUnitsUI
-	
+
+	--we assign a self.UnitUI property on the client so we can refer to it in other methods, as opposed to finding the PlayerGui and using ActiveUnitsUI:FindFirstChild(self.Identifier) every time
 	self.UnitUI = NewUnitUI
 
 	return self.Character
@@ -304,14 +339,15 @@ end
 function Unit:PropertyChanged(Property: string)
 	Client()
 	
-	--animate hp bar when health changes
+	--animate hp bar using the tween service when health changes
 	if Property == "HP" and self.UnitUI and self.UnitUI:FindFirstChild("HPBar") then
+		--right here the value is clamped just for UI purposes, the element is using a UICorner, so if the size value is too low it goes from a circle to a flat pancake (thanks roblox)
 		local HPScale = math.clamp((self.HP/self.MaxHP), .03, 1)
 		TweenService:Create(self.UnitUI.HPBar.Container.Bar, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Size = UDim2.fromScale(HPScale, 1)}):Play()
 		TweenService:Create(self.UnitUI.HPBar.Container.Marker, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Position = UDim2.fromScale(HPScale, 0.5)}):Play()
 	end
 	
-	--grey out ui when dead
+	--grey out ui using the tween service when the unit is dead (taken damage that amounted the health to 0)
 	if Property == "Dead" and self.Dead and self.UnitUI and self.UnitUI:FindFirstChild("HPBar") then
 		TweenService:Create(self.UnitUI.HPBar, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {ImageColor3 = Color3.fromRGB(127, 127, 127)}):Play()
 		TweenService:Create(self.UnitUI.HPBar.Container.Marker, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {ImageColor3 = Color3.fromRGB(127, 127, 127)}):Play()
@@ -332,26 +368,38 @@ function Unit:Move(): boolean?
 	if not self.Character then
 		return Utility.Debug(`{self._Properties.Name} [UID {self._Properties.Identifier}] has no character`)
 	end
-	
+
+	--we set a self.Moving property to ensure other methods such as self:Attack(Enemy) aren't called during a movement, this is just a design preference
 	self.Moving = true
-	
+
+	--here is just some boilerplate variable stuff, we use the :GetPivot() method of the character model to return a CFrame, and extrapolate the Position from this
+	--we then get the target CFrame & Position in the same manor, and calculate the duration the movement should take, based on the self.WalkSpeed property & the distance from start->target in studs (magnitude)
+	--the BOUNCE_AMPLITUDE & BOUNCE_FREQUENCY constants are made to control how the bouncing walk will behave, and do as they are described to by name
 	local StartPosition = self.Character:GetPivot().Position
 	local TargetCF: CFrame = self.Position
 	local TargetPosition = TargetCF.Position
 	local Duration = (TargetPosition - StartPosition).Magnitude / self.WalkSpeed
-	local BounceFrequency = 8
-	local BounceAmplitude = 0.5
-	
+	local BOUNCE_FREQUENCY = 8
+	local BOUNCE_AMPLITUDE = 0.5
+
+	--here we define the Movement variable before assigning it the RBXScriptConnection so that we can disconnect from inside of the connection itself
+	--this is used to disconnect and set to nil once the movement has ended & avoid a memory leak or incorrect behaviour
+	--the Elapsed variable is set to 0, and then modified by DeltaTime in the runservice prerender connection to be a way we gauge how far the movement is progress wise to reaching the Duration variable above
 	local Elapsed, Movement = 0, nil
 	Movement = RunService.PreRender:Connect(function(DeltaTime: number)
 		Elapsed += DeltaTime
 		
 		local Progress = math.min(Elapsed / Duration, 1)
+		--we're using this delta time effected progress variable to lerp the position from Start -> End point to make sure frame rate does not effect how fast the character moves (since we're using a PreRender connection)
 		local CurrentPosition = StartPosition:Lerp(TargetPosition, Progress)
-		
-		--walking bounce
-		local SideOffset = math.sin(Elapsed * BounceFrequency) * BounceAmplitude
-		local UpOffset = math.abs(math.sin(Elapsed * BounceFrequency * 2)) * BounceAmplitude * 0.3
+		--the SideOffset uses Elapsed * BOUNCE_FREQUENCY to make the character tilt left & right as it walks using a sine wave which will move between -1 and 1 gradually
+		--multiplying Elapsed by BOUNCE_FREQUENCY controls how fast the wobble occurs, and BOUNCE_AMPLITUDE controls how much it tilts
+		local SideOffset = math.sin(Elapsed * BOUNCE_FREQUENCY) * BOUNCE_AMPLITUDE
+		--UpOffset uses the same sine wave but doubled BOUNCE_FREQUENCY * 2 to make the character bob up/down twice as fast as it sways
+		--we use math.abs to ensure the value is always positive, so the character doesnt end up bobbing/clipping into the floor (cus we're not using collision)
+		local UpOffset = math.abs(math.sin(Elapsed * BOUNCE_FREQUENCY * 2)) * BOUNCE_AMPLITUDE * 0.3
+		--LookAtCFrame orients the character to face the target position, and we rotate it -90 degrees on the Y axis to correct the models default facing direction
+		--FinalCFrame then applies the SideOffset and UpOffset to the look-at position using CFrame.new, which moves the character relative to its facing direction
 		local LookAtCFrame = CFrame.lookAt(CurrentPosition, TargetPosition) * CFrame.Angles(0, math.rad(-90), 0)
 		local FinalCFrame = LookAtCFrame * CFrame.new(SideOffset, UpOffset, 0)
 		
@@ -369,3 +417,4 @@ function Unit:Move(): boolean?
 end
 
 return Unit
+
